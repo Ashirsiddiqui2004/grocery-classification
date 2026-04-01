@@ -1,1 +1,7 @@
-python -m streamlit run app.py
+sentence-transformers
+scikit-learn
+pandas
+numpy
+streamlit
+matplotlib
+seaborn
