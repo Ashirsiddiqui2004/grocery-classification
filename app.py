@@ -1,56 +1,72 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-from sentence_transformers import SentenceTransformer
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
-import hdbscan
-import umap
-import plotly.express as px
 import os
 
-st.set_page_config(page_title="Product Category Discovery", layout="wide")
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+from segmentation_core import (
+    DEFAULT_OTHERS_THRESHOLD,
+    TARGET_CATEGORIES,
+    build_category_centroids,
+    classify_products,
+    classify_single_product,
+    compute_umap_2d,
+    encode_texts,
+    load_model,
+    load_products,
+)
+
+st.set_page_config(page_title="Product Category Segmentation", layout="wide")
+
+DATA_PATH = os.path.join(os.path.dirname(__file__), "data", "Category_Names.xlsx")
+
 
 @st.cache_resource
-def load_model():
-    return SentenceTransformer('all-MiniLM-L6-v2')
+def get_model():
+    return load_model()
 
-model = load_model()
-
-# Load product names from Excel
-def load_products():
-    xlsx_path = os.path.join(os.path.dirname(__file__), "data", "Category_Names.xlsx")
-    if os.path.exists(xlsx_path):
-        df = pd.read_excel(xlsx_path)
-        df.columns = ["text", "original_label"]
-        df = df[df["text"].str.upper() != "TOTAL MARKET"].reset_index(drop=True)
-        return df
-    return pd.DataFrame(columns=["text", "original_label"])
 
 @st.cache_data
-def compute_embeddings(_model, texts):
-    return _model.encode(texts, normalize_embeddings=True)
+def get_products(path: str) -> pd.DataFrame:
+    return load_products(path)
+
 
 @st.cache_data
-def reduce_umap(embeddings, n_neighbors=15, min_dist=0.1):
-    reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=min_dist, random_state=42)
-    return reducer.fit_transform(embeddings)
+def get_embeddings(texts: tuple[str, ...]) -> np.ndarray:
+    model = get_model()
+    return encode_texts(model, list(texts))
 
-# --- Sidebar config ---
-st.sidebar.header("Clustering Settings")
 
-method = st.sidebar.selectbox("Algorithm", ["HDBSCAN", "K-Means"])
+@st.cache_resource
+def get_centroids():
+    model = get_model()
+    return build_category_centroids(model)
 
-if method == "K-Means":
-    n_clusters = st.sidebar.slider("Number of clusters", 2, 15, 5)
-else:
-    min_cluster_size = st.sidebar.slider("Min cluster size", 2, 15, 3)
-    min_samples = st.sidebar.slider("Min samples", 1, 10, 2)
 
+@st.cache_data
+def reduce_umap(embeddings: np.ndarray, n_neighbors: int, min_dist: float) -> np.ndarray:
+    return compute_umap_2d(embeddings, n_neighbors=n_neighbors, min_dist=min_dist, random_state=42)
+
+
+st.title("Product Category Segmentation")
+st.caption("Zero-shot classification into Food, Drinks, Home Care, Personal Care, and Others.")
+
+st.sidebar.header("Settings")
+threshold = st.sidebar.slider(
+    "Others threshold",
+    min_value=0.15,
+    max_value=0.50,
+    value=float(DEFAULT_OTHERS_THRESHOLD),
+    step=0.01,
+)
+st.sidebar.caption("Products scoring below this against all categories are classified as 'Others'.")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Visualization")
 umap_neighbors = st.sidebar.slider("UMAP neighbors", 5, 50, 15)
 umap_min_dist = st.sidebar.slider("UMAP min distance", 0.0, 1.0, 0.1, step=0.05)
 
-# Allow users to add extra product names
 st.sidebar.markdown("---")
 st.sidebar.subheader("Add Products")
 extra_products = st.sidebar.text_area(
@@ -58,140 +74,94 @@ extra_products = st.sidebar.text_area(
     placeholder="Laptop\nHeadphones\nPhone Case",
 )
 
-# --- Load and prepare data ---
-base_df = load_products()
-
-# Merge extra products
-extra_list = [p.strip() for p in extra_products.strip().split("\n") if p.strip()] if extra_products else []
-if extra_list:
-    extra_df = pd.DataFrame({"text": extra_list, "original_label": "User-added"})
+base_df = get_products(DATA_PATH)
+extra_items = [line.strip() for line in extra_products.splitlines() if line.strip()]
+if extra_items:
+    extra_df = pd.DataFrame({"text": extra_items, "original_label": "User-added"})
     df = pd.concat([base_df, extra_df], ignore_index=True)
 else:
     df = base_df.copy()
+df = df.drop_duplicates(subset=["text"]).reset_index(drop=True)
 
-if len(df) < 3:
-    st.error("Need at least 3 products to cluster.")
+if len(df) < 1:
+    st.error("No products loaded.")
     st.stop()
 
-texts = df["text"].tolist()
-embeddings = compute_embeddings(model, texts)
+model = get_model()
+embeddings = get_embeddings(tuple(df["text"].tolist()))
+centroids = get_centroids()
 
-# --- Clustering ---
-if method == "K-Means":
-    clusterer = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    labels = clusterer.fit_predict(embeddings)
-else:
-    clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
-        metric='euclidean',
-    )
-    labels = clusterer.fit_predict(embeddings)
+labels, _ = classify_products(embeddings, centroids, threshold=threshold)
+df["predicted_category"] = labels
 
-df["cluster"] = labels
-n_found = len(set(labels) - {-1})
+category_counts = df["predicted_category"].value_counts()
+others_count = int(category_counts.get("Others", 0))
 
-# Auto-name clusters using the most central product in each cluster
-cluster_names = {}
-for c in sorted(set(labels)):
-    if c == -1:
-        cluster_names[c] = "Noise / Outlier"
-        continue
-    mask = labels == c
-    cluster_embs = embeddings[mask]
-    centroid = cluster_embs.mean(axis=0)
-    centroid = centroid / np.linalg.norm(centroid)
-    # Find the product closest to the centroid
-    dists = np.dot(cluster_embs, centroid)
-    best_idx = np.argmax(dists)
-    representative = df[mask].iloc[best_idx]["text"]
-    members = df[mask]["text"].tolist()
-    # Use top-3 products as cluster name
-    top3_idx = np.argsort(dists)[-3:][::-1]
-    top3 = [df[mask].iloc[i]["text"] for i in top3_idx]
-    cluster_names[c] = f"Cluster {c}: {', '.join(top3)}"
-
-df["cluster_name"] = df["cluster"].map(cluster_names)
-
-# --- UI ---
-st.title("🔍 Product Category Discovery")
-st.caption("Unsupervised clustering — no predefined labels needed")
-
-# Metrics
 col1, col2, col3 = st.columns(3)
 col1.metric("Products", len(df))
-col2.metric("Clusters found", n_found)
-noise_count = (labels == -1).sum()
-if method == "HDBSCAN" and noise_count > 0:
-    col3.metric("Noise points", noise_count)
-else:
-    valid = labels[labels != -1]
-    if len(set(valid)) > 1:
-        sil = silhouette_score(embeddings[labels != -1], valid)
-        col3.metric("Silhouette score", f"{sil:.3f}")
+col2.metric("Categories used", int((category_counts > 0).sum()))
+col3.metric("Others / Unknown", others_count)
 
-# 2D scatter plot
-st.subheader("Cluster Map")
+st.subheader("Classification Results")
+category_rows = []
+for cat in TARGET_CATEGORIES:
+    members = df[df["predicted_category"] == cat]
+    if len(members) > 0:
+        examples = members["text"].head(5).tolist()
+        category_rows.append({
+            "Category": cat,
+            "Count": len(members),
+            "Examples": ", ".join(examples),
+        })
+if category_rows:
+    st.dataframe(pd.DataFrame(category_rows), use_container_width=True, hide_index=True)
+
+st.subheader("Category Map")
 coords_2d = reduce_umap(embeddings, n_neighbors=umap_neighbors, min_dist=umap_min_dist)
 plot_df = df.copy()
 plot_df["x"] = coords_2d[:, 0]
 plot_df["y"] = coords_2d[:, 1]
-plot_df["cluster_str"] = plot_df["cluster"].astype(str)
-
 fig = px.scatter(
-    plot_df, x="x", y="y", color="cluster_str", hover_data=["text", "original_label"],
-    title="Product Embeddings (UMAP 2D)",
-    labels={"cluster_str": "Cluster", "x": "", "y": ""},
-    height=550,
+    plot_df,
+    x="x",
+    y="y",
+    color="predicted_category",
+    hover_data=["text", "original_label"],
+    height=560,
+    labels={"x": "", "y": "", "predicted_category": "Category"},
+    title="Product Category Segmentation",
 )
-fig.update_traces(marker=dict(size=8, opacity=0.8))
-fig.update_layout(showlegend=True)
+fig.update_traces(marker={"size": 8, "opacity": 0.82})
 st.plotly_chart(fig, use_container_width=True)
 
-# Cluster breakdown
-st.subheader("Cluster Contents")
-for c in sorted(set(labels)):
-    name = cluster_names[c]
-    members = df[df["cluster"] == c][["text", "original_label"]].reset_index(drop=True)
-    with st.expander(f"{name} ({len(members)} products)"):
-        st.dataframe(members, use_container_width=True)
-
-# Compare with original labels
-if "original_label" in df.columns and df["original_label"].nunique() > 1:
-    st.subheader("Cluster vs Original Labels")
-    cross = pd.crosstab(df["cluster_name"], df["original_label"])
-    st.dataframe(cross, use_container_width=True)
-
-# Predict new product
-st.markdown("---")
-st.subheader("Assign a New Product")
-new_product = st.text_input("Enter product name:")
-if st.button("Find Cluster"):
-    if new_product.strip():
-        emb = model.encode([new_product.strip()], normalize_embeddings=True)[0]
-        if method == "K-Means":
-            pred = clusterer.predict(emb.reshape(1, -1))[0]
-            st.success(f"**{new_product}** → **{cluster_names[pred]}**")
-        else:
-            # For HDBSCAN: assign to nearest cluster centroid
-            best_cluster = -1
-            best_sim = -1
-            for c in sorted(set(labels)):
-                if c == -1:
-                    continue
-                mask = labels == c
-                centroid = embeddings[mask].mean(axis=0)
-                centroid = centroid / np.linalg.norm(centroid)
-                sim = float(np.dot(emb, centroid))
-                if sim > best_sim:
-                    best_sim = sim
-                    best_cluster = c
-            if best_sim < 0.35:
-                st.warning(f"**{new_product}** → **{cluster_names.get(best_cluster, 'Unknown')}** ⚠️ Low similarity ({best_sim:.2f}) — may not fit any cluster")
-            else:
-                st.success(f"**{new_product}** → **{cluster_names.get(best_cluster, 'Unknown')}** (similarity: {best_sim:.2f})")
+st.subheader("Classify a New Product")
+new_product = st.text_input("Enter product name")
+if st.button("Classify", use_container_width=True):
+    candidate = new_product.strip()
+    if not candidate:
+        st.warning("Please enter a product name.")
     else:
-        st.warning("Enter something")
-        with st.expander(f"Scores for {t}"):
-            for cat, score in scores:
-                st.write(f"- {cat}: {score}%")
+        result = classify_single_product(candidate, model, centroids, threshold=threshold)
+        if result["is_outlier"]:
+            st.warning(
+                f"'{candidate}' -> Others "
+                f"(best match: {result['best_category']} at {result['best_score']:.3f}, below threshold)"
+            )
+        else:
+            st.success(
+                f"'{candidate}' -> **{result['assigned_category']}** "
+                f"(score: {result['best_score']:.3f}, confidence: {result['confidence']})"
+            )
+
+        score_rows = [
+            {"Category": cat, "Similarity": round(score, 3)}
+            for cat, score in result["all_scores"]
+        ]
+        st.dataframe(pd.DataFrame(score_rows), use_container_width=True, hide_index=True)
+
+with st.expander("Inspect category members"):
+    for cat in TARGET_CATEGORIES:
+        members = df[df["predicted_category"] == cat][["text", "original_label"]].reset_index(drop=True)
+        if len(members) > 0:
+            st.markdown(f"**{cat}** ({len(members)} products)")
+            st.dataframe(members, use_container_width=True, hide_index=True)
