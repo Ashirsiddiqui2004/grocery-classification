@@ -5,3 +5,7 @@ numpy
 streamlit
 matplotlib
 seaborn
+openpyxl
+hdbscan
+umap-learn
+plotly
